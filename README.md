@@ -7,4 +7,4 @@ Develop a system for real-time indexing and keyword search of thousands of concu
 
 The Solution Pitch Deck: https://docs.google.com/presentation/d/1w7FCVq04WD4TT19FcnLCJZKTR5FnZBPSC04IoeGGPj4/edit?usp=sharing
 
-Currently on hold due to other commitments but plan to complete this prototype in the future.
+The devi
