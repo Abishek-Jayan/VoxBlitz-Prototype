@@ -1,4 +1,4 @@
-# VoxBlitz (Status: On Hold)
+# VoxBlitz
 
 A prototype idea I had for the North America Google Developer Groups On Campus Solution Challenge 2025, based on the following task:-
 
