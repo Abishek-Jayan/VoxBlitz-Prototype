@@ -9,6 +9,10 @@ import logging
 from ffmpeg import FFmpeg, Progress
 from google import genai
 from google.genai.types import Part
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 
 # Configure logging for debugging
@@ -16,14 +20,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Twitch API credentials
-CLIENT_ID = "ycjfxdt8nuc7kcevjzinfa8l4xaxz4"
-CLIENT_SECRET = "o99f3qzqhvl58z473ki89jtzfsrgz9"
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 
 
 app = FastAPI()
 
 
-client = genai.Client(api_key="AIzaSyAkTu1APiM_33fZaVeNSXPkPU5v8nUKs2I")
+client = genai.Client(api_key=os.getenv("API_KEY"))
 
 # Pydantic model for request body
 class SearchQuery(BaseModel):
