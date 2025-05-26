@@ -1,19 +1,15 @@
 import asyncio
-import tensorflow as tf
-import tensorflow_hub as hub
-import numpy as np
-import ffmpeg
-import streamlink  # Correct import
+import streamlink
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import io
 import concurrent.futures
-import time
+import os
 import aiohttp
 import logging
-import select
-import subprocess
 from ffmpeg import FFmpeg, Progress
+from google import genai
+from google.genai.types import Part
+
 
 # Configure logging for debugging
 logging.basicConfig(level=logging.INFO)
@@ -23,19 +19,17 @@ logger = logging.getLogger(__name__)
 CLIENT_ID = "ycjfxdt8nuc7kcevjzinfa8l4xaxz4"
 CLIENT_SECRET = "o99f3qzqhvl58z473ki89jtzfsrgz9"
 
+
 app = FastAPI()
 
+
+client = genai.Client(api_key="AIzaSyAkTu1APiM_33fZaVeNSXPkPU5v8nUKs2I")
 
 # Pydantic model for request body
 class SearchQuery(BaseModel):
     query: str
-    keyword: str = "hello"
-    max_results: int = 1
-
-
-# Load YamNet model
-yamnet_model = hub.load("https://tfhub.dev/google/yamnet/1")
-
+    keyword: str
+    max_results: int = 5
 
 async def get_access_token(client_id, client_secret):
     """Get an OAuth app access token from Twitch."""
@@ -76,7 +70,7 @@ async def get_live_streams(search_query, client_id, access_token, max_results):
             return streams
 
 
-def capture_audio_segment(stream_url, duration=10):
+def capture_audio_segment(stream_url, duration=120):
     """Capture a 10-second audio segment from a Twitch stream to feed into Tensorflow YAMNet."""
     # for attempt in range(max_attempts):
     # Initialize streamlink with options to handle HLS streams
@@ -93,27 +87,8 @@ def capture_audio_segment(stream_url, duration=10):
 
     stream_new_url = streams[quality].to_url()
 
-    # ffmpeg_cmd = [
-    #     "ffmpeg",
-    #     "-i",
-    #     "pipe:0",
-    #     "-f",
-    #     "s16le",
-    #     "-t",
-    #     str(duration),
-    #     "-acodec",
-    #     "pcm_s16le",
-    #     "-ac",
-    #     "1",
-    #     "-ar",
-    #     "16000",
-    #     "-loglevel",
-    #     "warning",
-    #     "pipe:1",
-    # ]
-
     f_fmpeg = (
-        FFmpeg().input(stream_new_url).output("pipe:1", {"f":"s16le", "acodec":"pcm_s16le", "ac":"1", "ar":"16000"})
+        FFmpeg().input(stream_new_url).output("pipe:1", {"f":"wav", "ac":"1", "ar":"16000"})
     )
     @f_fmpeg.on("progress")
     def on_progress(progress: Progress):
@@ -121,57 +96,61 @@ def capture_audio_segment(stream_url, duration=10):
         if progress.time.seconds > duration + 5:
             f_fmpeg.terminate()
     audio_bytes = f_fmpeg.execute()
-    audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-    logger.info(f"Captured {len(audio_np)} samples from {stream_url}")
-    return audio_np
+    return audio_bytes
 
 
-def detect_keyword(audio_samples, keyword):
-    """Detect if the keyword is spoken in the audio using YamNet (synchronous)."""
+async def detect_keyword(audio_samples, keyword):
+    """
+    Detect if the keyword is spoken in the audio bytes using Gemini 2.0 Flash.
+    """
+    # Create an audio part from the bytes. Use 'audio/wav' as MIME type for PCM s16le.
+    audio_part = Part.from_bytes(data=audio_samples, mime_type="audio/wav")
+    print("Did we reach here?")
+
+    # Construct the prompt to ask Gemini to analyze the audio for the keyword.
+    prompt = f"Analyze the provided audio. Is the word '{keyword}' explicitly spoken in this audio? Respond with just the timestamp that word was spoken in if it is, and 'NO' if it is not. Only respond with the timestamp or 'NO'."
+    
     try:
-        if audio_samples is None:
-            return False
-        # Ensure audio_samples is a numpy array
-        audio_samples = np.array(audio_samples, dtype=np.float32)
-        # YAMNet expects mono audio at 16kHz, already handled in capture_audio_segment
-        scores, embeddings, waveform = yamnet_model(audio_samples)
-        print("We got here")
-        class_map_path = (
-            hub.resolve("https://tfhub.dev/google/yamnet/1") + "/assets/yamnet_class_map.csv"
+        # Pass both the text prompt and the audio part to Gemini 2.0 Flash
+        response = client.models.generate_content(
+        model='gemini-2.0-flash',
+        contents=[
+        prompt,
+        audio_part
+        ]
         )
-        my_classes = [keyword]
-        model = tf.keras.Sequential([
-        tf.keras.layers.Input(shape=(1024), dtype=tf.float32),
-        tf.keras.layers.Dense(128, activation='relu'),
-        tf.keras.layers.Dense(len(my_classes), activation='softmax')
-        ])
-        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.0003),
-              loss='sparse_categorical_crossentropy',
-              metrics=['accuracy'])
-        model.fit(embeddings, labels, epochs=15, validation_split=0.2)
-        mean_scores = np.mean(scores, axis=0)
-        speech_score = mean_scores[]
-        print("Did this work?")
-        return speech_score > 0.5  # Placeholder threshold
+        print(response.text)
+        gemini_output = response.text.strip().upper()
+        logger.info(f"Gemini output for keyword '{keyword}': {gemini_output}")
+
+        return gemini_output
     except Exception as e:
-        logger.error(f"Error processing audio for keyword detection: {e}")
+        logger.error(f"Error calling Gemini API for keyword detection with audio: {e}")
         return False
 
 
 async def process_stream(stream, keyword):
     """Process a single stream: capture audio and detect keyword."""
+    user_name = stream["user_name"]
+    stream_url = stream["stream_url"]
     try:
         loop = asyncio.get_event_loop()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        max_workers = os.cpu_count() or 1
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
             audio_samples = await asyncio.wait_for(
                 loop.run_in_executor(pool, capture_audio_segment, stream["stream_url"]),
-                timeout=30.0
+                timeout=600.0
             )
             logger.info(f"Audio samples for {stream['user_name']}: {'None' if audio_samples is None else len(audio_samples)}")
-            if audio_samples is not None:
-                result = await loop.run_in_executor(pool, detect_keyword, audio_samples, keyword)
-                return {"user_name": stream["user_name"], "keyword_detected": result}
-            return {"user_name": stream["user_name"], "keyword_detected": False}
+            if audio_samples is None:
+                logger.warning(f"No audio captured for {user_name}.")
+                return {"user_name": user_name, "keyword_detected": False, "reason": "No audio captured"}
+            print("Audio samples is not None")
+            # Detect keyword directly with Gemini 2.0 Flash using the audio bytes
+            keyword_detected = await detect_keyword(audio_samples, keyword)                
+
+            logger.info(f"Keyword detection for {user_name} complete. Detected: {keyword_detected}")
+            return {"user_name": stream["user_name"], "keyword_detected": keyword_detected}
     except asyncio.TimeoutError:
         logger.error(f"Timeout processing stream {stream['user_name']}")
         return {"user_name": stream["user_name"], "keyword_detected": False}
