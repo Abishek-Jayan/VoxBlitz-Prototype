@@ -10,10 +10,17 @@ from ffmpeg import FFmpeg, Progress
 from google import genai
 from google.genai.types import Part
 from dotenv import load_dotenv
+import firebase_admin
+from firebase_admin import credentials, firestore
+import hashlib
+import datetime
 
 load_dotenv()
 
-
+# Initialize Firebase
+cred = credentials.Certificate("voxblitz-70eca6003735.json")  # Replace with your service account key path
+firebase_admin.initialize_app(cred)
+db = firestore.client()
 
 # Configure logging for debugging
 logging.basicConfig(level=logging.INFO)
@@ -33,7 +40,7 @@ client = genai.Client(api_key=os.getenv("API_KEY"))
 class SearchQuery(BaseModel):
     query: str
     keyword: str
-    max_results: int = 5
+    max_results: int = 10
 
 async def get_access_token(client_id, client_secret):
     """Get an OAuth app access token from Twitch."""
@@ -49,6 +56,37 @@ async def get_access_token(client_id, client_secret):
             data = await response.json()
             return data["access_token"]
 
+
+def generate_doc_id(query: str, keyword: str,max_results: str) -> str:
+    """Generate a unique document ID for the query and keyword pair."""
+    # Use a hash to create a consistent, unique ID
+    combined = f"{query.lower()}_{keyword.lower()}_{max_results}"
+    return hashlib.md5(combined.encode()).hexdigest()
+
+
+async def check_cached_results(query: str, keyword: str, max_results:str) -> list:
+    """Check Firestore for cached results for the query and keyword."""
+    doc_id = generate_doc_id(query, keyword,max_results)
+    doc_ref = db.collection("voxblitz").document(doc_id)
+    doc = doc_ref.get()
+    if doc.exists:
+        logger.info(f"Found cached results for query: {query}, keyword: {keyword}")
+        return doc.to_dict().get("results", [])
+    return None
+
+async def store_results(query: str, keyword: str, max_results:str, results: list):
+    """Store results in Firestore under the query and keyword."""
+    doc_id = generate_doc_id(query, keyword,max_results)
+    doc_ref = db.collection("voxblitz").document(doc_id)
+    if not doc_ref.get().exists:
+
+        doc_ref.set({
+            "query": query,
+            "keyword": keyword,
+            "results": results,
+            "created_at": datetime.datetime.now()
+        })
+        logger.info(f"Stored results for query: {query}, keyword: {keyword}")
 
 async def get_live_streams(search_query, client_id, access_token, max_results):
     """Fetch live streams based on a search query."""
@@ -74,7 +112,7 @@ async def get_live_streams(search_query, client_id, access_token, max_results):
             return streams
 
 
-def capture_audio_segment(stream_url, duration=120):
+def capture_audio_segment(stream_url, duration=10):
     """Capture a 10-second audio segment from a Twitch stream to feed into Tensorflow YAMNet."""
     # for attempt in range(max_attempts):
     # Initialize streamlink with options to handle HLS streams
@@ -109,7 +147,6 @@ async def detect_keyword(audio_samples, keyword):
     """
     # Create an audio part from the bytes. Use 'audio/wav' as MIME type for PCM s16le.
     audio_part = Part.from_bytes(data=audio_samples, mime_type="audio/wav")
-    print("Did we reach here?")
 
     # Construct the prompt to ask Gemini to analyze the audio for the keyword.
     prompt = f"Analyze the provided audio. Is the word '{keyword}' explicitly spoken in this audio? Respond with just the timestamp that word was spoken in if it is, and 'NO' if it is not. Only respond with the timestamp or 'NO'."
@@ -123,7 +160,6 @@ async def detect_keyword(audio_samples, keyword):
         audio_part
         ]
         )
-        print(response.text)
         gemini_output = response.text.strip().upper()
         logger.info(f"Gemini output for keyword '{keyword}': {gemini_output}")
 
@@ -149,7 +185,6 @@ async def process_stream(stream, keyword):
             if audio_samples is None:
                 logger.warning(f"No audio captured for {user_name}.")
                 return {"user_name": user_name, "keyword_detected": False, "reason": "No audio captured"}
-            print("Audio samples is not None")
             # Detect keyword directly with Gemini 2.0 Flash using the audio bytes
             keyword_detected = await detect_keyword(audio_samples, keyword)                
 
@@ -167,6 +202,13 @@ async def process_stream(stream, keyword):
 async def search_streams(query: SearchQuery):
     """API endpoint to search Twitch streams and detect keyword."""
     try:
+
+        cached_results = await check_cached_results(query.query, query.keyword,str(query.max_results))
+        if cached_results:
+            logger.info(f"Returning cached results for query: {query.query}, keyword: {query.keyword}")
+            return cached_results
+
+
         # Get access token
         access_token = await get_access_token(CLIENT_ID, CLIENT_SECRET)
 
@@ -195,6 +237,19 @@ async def search_streams(query: SearchQuery):
                         f"True: Keyword '{query.keyword}' detected in stream {result['user_name']}"
                     )
                 response.append(result)
+
+        await store_results(query.query, query.keyword, str(query.max_results), response)
+
+
+        # prompt = f"Find me 10 similar words to {query.keyword} and respond with them comma seperated. Only give me the comma seperated words. Do not duplicate any words"
+        # resp = client.models.generate_content(
+        # model='gemini-2.0-flash',
+        # contents=[prompt])
+        # keywordss = resp.text.strip().split(",")
+        # print(keywordss)
+        # for key in keywordss:
+        #     print(key)
+        #     await store_results(query.query, key, str(query.max_results), resp)
 
         return response
 
