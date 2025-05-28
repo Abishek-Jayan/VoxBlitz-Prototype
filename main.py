@@ -112,12 +112,11 @@ async def get_live_streams(search_query, client_id, access_token, max_results):
             return streams
 
 
-def capture_audio_segment(stream_url, duration=10):
+def capture_audio_segment(stream_url, duration=10, offset=0):
     """Capture a 10-second audio segment from a Twitch stream to feed into Tensorflow YAMNet."""
     # for attempt in range(max_attempts):
     # Initialize streamlink with options to handle HLS streams
     session = streamlink.Streamlink()
-    session.set_option("hls-duration", duration)
     session.set_option("hls-live-edge", 4)
     # Configure FFmpeg options for Streamlink
     streams = session.streams(stream_url)
@@ -130,12 +129,12 @@ def capture_audio_segment(stream_url, duration=10):
     stream_new_url = streams[quality].to_url()
 
     f_fmpeg = (
-        FFmpeg().input(stream_new_url).output("pipe:1", {"f":"wav", "ac":"1", "ar":"16000"})
+        FFmpeg().input(stream_new_url).output("pipe:1", {"f":"wav", "ac":"1", "ar":"16000","ss": str(offset)})
     )
     @f_fmpeg.on("progress")
     def on_progress(progress: Progress):
         print(progress)
-        if progress.time.seconds > duration + 5:
+        if progress.time.seconds > duration + offset + 5:
             f_fmpeg.terminate()
     audio_bytes = f_fmpeg.execute()
     return audio_bytes
@@ -169,34 +168,54 @@ async def detect_keyword(audio_samples, keyword):
         return False
 
 
-async def process_stream(stream, keyword):
+async def process_stream(stream, keyword, max_attempts=3, segment_duration=30, offset_increment=15):
     """Process a single stream: capture audio and detect keyword."""
     user_name = stream["user_name"]
     stream_url = stream["stream_url"]
-    try:
-        loop = asyncio.get_event_loop()
-        max_workers = os.cpu_count() or 1
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            audio_samples = await asyncio.wait_for(
-                loop.run_in_executor(pool, capture_audio_segment, stream["stream_url"]),
-                timeout=600.0
-            )
-            logger.info(f"Audio samples for {stream['user_name']}: {'None' if audio_samples is None else len(audio_samples)}")
-            if audio_samples is None:
-                logger.warning(f"No audio captured for {user_name}.")
-                return {"user_name": user_name, "keyword_detected": False, "reason": "No audio captured"}
-            # Detect keyword directly with Gemini 2.0 Flash using the audio bytes
-            keyword_detected = await detect_keyword(audio_samples, keyword)                
-
-            logger.info(f"Keyword detection for {user_name} complete. Detected: {keyword_detected}")
-            return {"user_name": stream["user_name"], "keyword_detected": keyword_detected}
-    except asyncio.TimeoutError:
-        logger.error(f"Timeout processing stream {stream['user_name']}")
-        return {"user_name": stream["user_name"], "keyword_detected": False}
-    except Exception as e:
-        logger.error(f"Error processing stream {stream['user_name']}: {str(e)}")
-        return {"user_name": stream["user_name"], "keyword_detected": False}
-
+    attempt = 0
+    keyword_detected = False
+    timestamp = "NO"
+    while attempt < max_attempts and not keyword_detected:
+        try:
+            loop = asyncio.get_event_loop()
+            max_workers = os.cpu_count() or 1
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                offset = attempt * offset_increment
+                logger.info(f"Attempt {attempt + 1}/{max_attempts} for {user_name} with offset {offset}s")
+                audio_samples = await asyncio.wait_for(
+                    loop.run_in_executor(pool, capture_audio_segment, stream_url,segment_duration, offset),
+                    timeout=600.0
+                )
+                logger.info(f"Audio samples for {user_name}: {'None' if audio_samples is None else len(audio_samples)}")
+                if audio_samples is None:
+                    logger.warning(f"No audio captured for {user_name}.")
+                    attempt += 1
+                    continue
+                # Detect keyword directly with Gemini 2.0 Flash using the audio bytes
+                result = await detect_keyword(audio_samples, keyword)
+                timestamp = result
+                keyword_detected = result != "NO"              
+                if keyword_detected:
+                    logger.info(f"Keyword '{keyword}' detected in {user_name} on attempt {attempt + 1} at timestamp {timestamp}")
+                    break
+                else:
+                    logger.info(f"Keyword '{keyword}' not detected in {user_name} on attempt {attempt + 1}")
+                
+                attempt += 1
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout processing stream {user_name} on attempt {attempt + 1}")
+            attempt += 1
+            continue
+        except Exception as e:
+            logger.error(f"Error processing stream {user_name} on attempt {attempt + 1}: {str(e)}")
+            attempt += 1
+            continue
+    if not keyword_detected:
+            reason = f"Keyword not detected after {max_attempts} attempts"
+            logger.warning(f"{reason} for {user_name}")
+            return {"user_name": user_name, "keyword_detected": False, "reason": reason}
+        
+    return {"user_name": user_name, "keyword_detected": True, "timestamp": timestamp}
 
 @app.post("/search_streams")
 async def search_streams(query: SearchQuery):
