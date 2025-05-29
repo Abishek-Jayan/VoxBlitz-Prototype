@@ -1,6 +1,7 @@
 import asyncio
 import streamlink
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import concurrent.futures
 import os
@@ -31,7 +32,27 @@ CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 
 
+
+
 app = FastAPI()
+
+# Define the origins that should be allowed to make cross-origin requests
+origins = [
+    "http://localhost:5173",  # React frontend URL
+    "http://127.0.0.1:5173",  # Alternative localhost URL
+    # Add other origins if needed, e.g., production frontend URL
+]
+
+# Add CORS middleware to the application
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # List of allowed origins
+    allow_credentials=True,  # Allow cookies and credentials
+    allow_methods=["*"],     # Allow all HTTP methods (GET, POST, etc.)
+    allow_headers=["*"],     # Allow all headers
+)
+
+
 
 
 client = genai.Client(api_key=os.getenv("API_KEY"))
