@@ -1,6 +1,6 @@
 # VoxBlitz: Streaming Search Engine
 
-A prototype idea I had for the North America Google Developer Groups On Campus Solution Challenge 2025, based on the following task:-
+The project that won me 2nd place in the North America Google Developer Groups On Campus Solution Challenge 2025, based on the following task:-
 
 Develop a system for real-time indexing and keyword search of thousands of concurrent live audio streams, enabling near-instant discovery of spoken content. The solution must achieve high accuracy and low latency while remaining scalable and cost-effective, supporting interactive features like live comments, tipping, and call-ins for live audio broadcasts and conversations.
 
