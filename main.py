@@ -15,13 +15,20 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 import hashlib
 import datetime
+import io
+import re
+import shutil
+import glob
+import wave
 
 load_dotenv()
 
 # Initialize Firebase
-cred = credentials.Certificate("voxblitz-70eca6003735.json")  # Replace with your service account key path
-firebase_admin.initialize_app(cred)
-db = firestore.client()
+FIREBASE_KEY_PATH = os.getenv("FIREBASE_KEY_PATH", "voxblitz-70eca6003735.json")
+db = None
+if os.path.exists(FIREBASE_KEY_PATH):
+    firebase_admin.initialize_app(credentials.Certificate(FIREBASE_KEY_PATH))
+    db = firestore.client()
 
 # Configure logging for debugging
 logging.basicConfig(level=logging.INFO)
@@ -38,15 +45,14 @@ app = FastAPI()
 
 # Define the origins that should be allowed to make cross-origin requests
 origins = [
-    "http://localhost:5173",  # React frontend URL
-    "http://127.0.0.1:5173",  # Alternative localhost URL
-    # Add other origins if needed, e.g., production frontend URL
+    "http://localhost:5173",  
+    "http://127.0.0.1:5173",  
 ]
 
 # Add CORS middleware to the application
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # List of allowed origins
+    allow_origins=origins,  # List of allowed origins
     allow_credentials=True,  # Allow cookies and credentials
     allow_methods=["*"],     # Allow all HTTP methods (GET, POST, etc.)
     allow_headers=["*"],     # Allow all headers
@@ -55,13 +61,27 @@ app.add_middleware(
 
 
 
-client = genai.Client(api_key=os.getenv("API_KEY"))
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+GEMINI_FALLBACK_MODELS = os.getenv("GEMINI_FALLBACK_MODELS", "gemini-3.1-flash-lite").split(",")
+client = genai.Client(api_key=os.getenv("API_KEY") or os.getenv("GEMINI_API_KEY"))
 
 # Pydantic model for request body
 class SearchQuery(BaseModel):
     query: str
     keyword: str
     max_results: int = 10
+    max_attempts: int = 3  # how many 10s windows to check, newest first
+
+async def with_retries(fn, *args, attempts=4, delay=1.0):
+    """Retry transient network failures (e.g. flaky DNS) with a short backoff."""
+    for i in range(attempts):
+        try:
+            return await fn(*args)
+        except aiohttp.ClientConnectionError:
+            if i == attempts - 1:
+                raise
+            await asyncio.sleep(delay * (i + 1))
+
 
 async def get_access_token(client_id, client_secret):
     """Get an OAuth app access token from Twitch."""
@@ -87,9 +107,11 @@ def generate_doc_id(query: str, keyword: str,max_results: str) -> str:
 
 async def check_cached_results(query: str, keyword: str, max_results:str) -> list:
     """Check Firestore for cached results for the query and keyword."""
+    if db is None:
+        return None
     doc_id = generate_doc_id(query, keyword,max_results)
     doc_ref = db.collection("voxblitz").document(doc_id)
-    doc = doc_ref.get()
+    doc = await asyncio.to_thread(doc_ref.get)
     if doc.exists:
         logger.info(f"Found cached results for query: {query}, keyword: {keyword}")
         return doc.to_dict().get("results", [])
@@ -97,11 +119,13 @@ async def check_cached_results(query: str, keyword: str, max_results:str) -> lis
 
 async def store_results(query: str, keyword: str, max_results:str, results: list):
     """Store results in Firestore under the query and keyword."""
+    if db is None:
+        return
     doc_id = generate_doc_id(query, keyword,max_results)
     doc_ref = db.collection("voxblitz").document(doc_id)
-    if not doc_ref.get().exists:
+    if not (await asyncio.to_thread(doc_ref.get)).exists:
 
-        doc_ref.set({
+        await asyncio.to_thread(doc_ref.set, {
             "query": query,
             "keyword": keyword,
             "results": results,
@@ -109,56 +133,180 @@ async def store_results(query: str, keyword: str, max_results:str, results: list
         })
         logger.info(f"Stored results for query: {query}, keyword: {keyword}")
 
+TITLE_SCAN_PAGES = 3  # pages of 100 top live streams to scan for title matches
+
+
+def _stream_entry(user_id, user_login, user_name):
+    return {
+        "user_name": user_name,
+        "stream_url": f"https://www.twitch.tv/{user_login}",
+        "user_id": user_id,
+    }
+
+
 async def get_live_streams(search_query, client_id, access_token, max_results):
-    """Fetch live streams based on a search query."""
-    url = "https://api.twitch.tv/helix/streams"
+    """Find live streams for a free-text query.
+
+    Twitch has no title search, so combine: streams whose title/name contains the query
+    (scanned from the top live streams), live channels whose name matches, and live
+    streams in categories that match the query. Title/name matches rank first.
+    """
+    base = "https://api.twitch.tv/helix/"
     headers = {"Client-ID": client_id, "Authorization": f"Bearer {access_token}"}
-    params = {"first": max_results, "game_name": search_query}
+    needle = search_query.lower().strip()
+    ranked, seen = [], set()
+
+    def add(entry):
+        if entry["user_id"] not in seen:
+            seen.add(entry["user_id"])
+            ranked.append(entry)
+
+    async with aiohttp.ClientSession(headers=headers) as session:
+        async def get(path, **params):
+            async with session.get(base + path, params=params) as response:
+                response.raise_for_status()
+                return await response.json()
+
+        # 1. title / channel-name matches among the top live streams
+        cursor = None
+        for _ in range(TITLE_SCAN_PAGES):
+            params = {"first": 100}
+            if cursor:
+                params["after"] = cursor
+            page = await get("streams", **params)
+            for st in page.get("data", []):
+                if needle in st["title"].lower() or needle in st["user_login"].lower():
+                    add(_stream_entry(st["user_id"], st["user_login"], st["user_name"]))
+            cursor = page.get("pagination", {}).get("cursor")
+            if not cursor:
+                break
+
+        # 2. live channels whose name matches (reaches below the top-300 scan)
+        data = (await get("search/channels", query=search_query, live_only="true", first=max_results)).get("data", [])
+        for ch in data:
+            add(_stream_entry(ch["id"], ch["broadcaster_login"], ch["display_name"]))
+
+        # 3. live streams in categories matching the query
+        cats = (await get("search/categories", query=search_query, first=3)).get("data", [])
+        for cat in cats:
+            page = await get("streams", game_id=cat["id"], first=max_results)
+            for st in page.get("data", []):
+                add(_stream_entry(st["user_id"], st["user_login"], st["user_name"]))
+
+    logger.info(f"Found {len(ranked)} live streams for '{search_query}'")
+    return ranked[:max_results]
+
+
+MAX_STREAMS = 30  # keeps one search within a sane Gemini quota
+MAX_WINDOWS = 3  # the live playlist only holds ~28s
+SAMPLE_RATE = 16000
+BYTES_PER_SECOND = SAMPLE_RATE * 2  # mono, 16-bit
+WINDOW_SECONDS = 10
+HLS_SEGMENT_SECONDS = 2
+MAX_BACKLOG_SEGMENTS = 14  # Twitch keeps only ~28s of segments on the live playlist
+MIN_WINDOW_SECONDS = 5  # drop a leftover slice shorter than this
+CAPTURE_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=32)
+
+
+def find_ffmpeg():
+    """FFMPEG_PATH, then PATH, then WinGet's install dir (a shell opened before install lacks it on PATH)."""
+    env_path = os.getenv("FFMPEG_PATH")
+    if env_path:
+        return env_path
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    local = os.getenv("LOCALAPPDATA")
+    if local:
+        links = os.path.join(local, "Microsoft", "WinGet", "Links", "ffmpeg.exe")
+        if os.path.exists(links):
+            return links
+        pkgs = glob.glob(os.path.join(local, "Microsoft", "WinGet", "Packages", "*FFmpeg*", "**", "ffmpeg.exe"), recursive=True)
+        if pkgs:
+            return pkgs[0]
+    raise RuntimeError("ffmpeg not found: install it or set FFMPEG_PATH in .env")
+
+
+def capture_recent_audio(stream_url, seconds):
+    """Grab up to `seconds` of the most recent audio, ending at the live edge.
+
+    The live playlist is short, so the result may be shorter than requested.
+    Returns raw 16 kHz mono s16le PCM bytes.
+    """
+    last_err = None
+    for _ in range(3):  # streamlink's Twitch lookup can fail transiently (DNS etc.)
+        try:
+            streams = streamlink.Streamlink().streams(stream_url)
+            break
+        except Exception as e:
+            last_err = e
+    else:
+        raise last_err
+    quality = "audio_only" if "audio_only" in streams else "worst"
+    url = streams[quality].to_url()
+
+    segments = min(MAX_BACKLOG_SEGMENTS, -(-seconds // HLS_SEGMENT_SECONDS))
+    ff = (
+        FFmpeg(find_ffmpeg())
+        .input(url, {"live_start_index": str(-segments)})
+        .output("pipe:1", {"f": "s16le", "ac": "1", "ar": str(SAMPLE_RATE), "t": str(seconds)})
+    )
+    return ff.execute()
+
+
+def split_windows(pcm, window_seconds=WINDOW_SECONDS, max_windows=3):
+    """Slice PCM into windows, newest first.
+
+    Yields (seconds_from_window_start_to_end_of_capture, window_length_seconds, wav_bytes).
+    """
+    size = window_seconds * BYTES_PER_SECOND
+    end = len(pcm)
+    for k in range(max_windows):
+        if end <= 0:
+            break
+        start = max(0, end - size)
+        chunk = pcm[start:end]
+        length = len(chunk) / BYTES_PER_SECOND
+        if k > 0 and length < MIN_WINDOW_SECONDS:
+            break
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(SAMPLE_RATE)
+            w.writeframes(chunk)
+        yield (len(pcm) - start) / BYTES_PER_SECOND, length, buf.getvalue()
+        end = start
+
+
+def parse_timestamp(text):
+    """First mm:ss or h:mm:ss in Gemini's reply, in seconds; None if there is none."""
+    m = re.search(r"(?:(\d+):)?(\d{1,2}):(\d{2})", text or "")
+    if not m:
+        return None
+    return int(m.group(1) or 0) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+
+
+def fmt_hms(total):
+    """Seconds -> Twitch's ?t= format, e.g. 1h2m3s."""
+    h, rem = divmod(max(0, int(total)), 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}h{m}m{sec}s"
+
+
+async def get_current_vod(user_id, client_id, access_token):
+    """The channel's in-progress broadcast VOD, or None if the streamer has VODs off."""
+    url = "https://api.twitch.tv/helix/videos"
+    headers = {"Client-ID": client_id, "Authorization": f"Bearer {access_token}"}
+    params = {"user_id": user_id, "type": "archive", "first": 1}
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers, params=params) as response:
             response.raise_for_status()
-            data = await response.json()
-            streams_data = data.get("data", [])
-            if streams_data:
-                logger.info(f"Found stream: {streams_data[0]}")
-            else:
-                logger.info("No streams found for the query")
-            streams = [
-                {
-                    "user_name": stream["user_name"],
-                    "stream_url": f'https://www.twitch.tv/{stream["user_login"]}',
-                }
-                for stream in streams_data
-            ]
-            return streams
-
-
-def capture_audio_segment(stream_url, duration=10, offset=0):
-    """Capture a 10-second audio segment from a Twitch stream to feed into Tensorflow YAMNet."""
-    # for attempt in range(max_attempts):
-    # Initialize streamlink with options to handle HLS streams
-    session = streamlink.Streamlink()
-    session.set_option("hls-live-edge", 4)
-    # Configure FFmpeg options for Streamlink
-    streams = session.streams(stream_url)
-
-
-
-    # Prefer 'audio_only', fallback to 'worst'
-    quality = "audio_only" if "audio_only" in streams else "worst"
-
-    stream_new_url = streams[quality].to_url()
-
-    f_fmpeg = (
-        FFmpeg().input(stream_new_url).output("pipe:1", {"f":"wav", "ac":"1", "ar":"16000","ss": str(offset)})
-    )
-    @f_fmpeg.on("progress")
-    def on_progress(progress: Progress):
-        print(progress)
-        if progress.time.seconds > duration + offset + 5:
-            f_fmpeg.terminate()
-    audio_bytes = f_fmpeg.execute()
-    return audio_bytes
+            data = (await response.json()).get("data", [])
+    if not data:
+        return None
+    created = datetime.datetime.fromisoformat(data[0]["created_at"].replace("Z", "+00:00"))
+    return {"url": data[0]["url"], "created_at": created}
 
 
 async def detect_keyword(audio_samples, keyword):
@@ -171,90 +319,109 @@ async def detect_keyword(audio_samples, keyword):
     # Construct the prompt to ask Gemini to analyze the audio for the keyword.
     prompt = f"Analyze the provided audio. Is the word '{keyword}' explicitly spoken in this audio? Respond with just the timestamp that word was spoken in if it is, and 'NO' if it is not. Only respond with the timestamp or 'NO'."
     
-    try:
-        # Pass both the text prompt and the audio part to Gemini 2.0 Flash
-        response = client.models.generate_content(
-        model='gemini-2.0-flash',
-        contents=[
-        prompt,
-        audio_part
-        ]
-        )
-        gemini_output = response.text.strip().upper()
-        logger.info(f"Gemini output for keyword '{keyword}': {gemini_output}")
+    models = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACK_MODELS if m != GEMINI_MODEL]
+    last_exc = None
+    for attempt in range(4):
+        # Retry transient errors (429/5xx) with backoff, rotating through fallback models
+        model = models[attempt % len(models)]
+        try:
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model=model,
+                contents=[prompt, audio_part],
+            )
+            gemini_output = (response.text or "").strip().upper()
+            logger.info(f"Gemini output for keyword '{keyword}' ({model}): {gemini_output}")
+            return gemini_output
+        except Exception as e:
+            last_exc = e
+            code = getattr(e, "code", None)
+            if code not in (429, 500, 503, 504):
+                break
+            m = re.search(r"retry in ([\d.]+)s", str(e))
+            delay = min(float(m.group(1)), 30) if m else 2 ** attempt
+            logger.warning(f"Gemini {model} transient error {code}, retrying in {delay:.0f}s")
+            await asyncio.sleep(delay)
+    logger.error(f"Error calling Gemini API for keyword detection with audio: {last_exc}")
+    raise last_exc
 
-        return gemini_output
-    except Exception as e:
-        logger.error(f"Error calling Gemini API for keyword detection with audio: {e}")
-        return False
 
-
-async def process_stream(stream, keyword, max_attempts=3, segment_duration=30, offset_increment=15):
-    """Process a single stream: capture audio and detect keyword."""
+async def process_stream(stream, keyword, vod_lookup, max_attempts=3):
+    """Sliding window over one stream: check the latest 10s, then the 10s before it, and so on."""
     user_name = stream["user_name"]
     stream_url = stream["stream_url"]
-    attempt = 0
-    keyword_detected = False
-    timestamp = "NO"
-    while attempt < max_attempts and not keyword_detected:
+    base = {"user_name": user_name, "stream_url": stream_url}
+    loop = asyncio.get_running_loop()
+    try:
+        pcm = await asyncio.wait_for(
+            loop.run_in_executor(
+                CAPTURE_POOL, capture_recent_audio, stream_url, max_attempts * WINDOW_SECONDS
+            ),
+            timeout=120.0,
+        )
+    except Exception as e:
+        logger.error(f"Capture failed for {user_name}: {e!r}")
+        return {**base, "keyword_detected": False, "reason": f"Capture failed: {str(e)[:200]}"}
+    captured_at = datetime.datetime.now(datetime.timezone.utc)
+    if not pcm:
+        return {**base, "keyword_detected": False, "reason": "No audio captured"}
+
+    last_error = None
+    checked = 0
+    for k, (back, length, wav) in enumerate(split_windows(pcm, max_windows=max_attempts)):
+        logger.info(f"Window {k + 1}/{max_attempts} for {user_name} ({length:.0f}s, starts {back:.0f}s back)")
         try:
-            loop = asyncio.get_event_loop()
-            max_workers = os.cpu_count() or 1
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-                offset = attempt * offset_increment
-                logger.info(f"Attempt {attempt + 1}/{max_attempts} for {user_name} with offset {offset}s")
-                audio_samples = await asyncio.wait_for(
-                    loop.run_in_executor(pool, capture_audio_segment, stream_url,segment_duration, offset),
-                    timeout=600.0
-                )
-                logger.info(f"Audio samples for {user_name}: {'None' if audio_samples is None else len(audio_samples)}")
-                if audio_samples is None:
-                    logger.warning(f"No audio captured for {user_name}.")
-                    attempt += 1
-                    continue
-                # Detect keyword directly with Gemini 2.0 Flash using the audio bytes
-                result = await detect_keyword(audio_samples, keyword)
-                timestamp = result
-                keyword_detected = result != "NO"              
-                if keyword_detected:
-                    logger.info(f"Keyword '{keyword}' detected in {user_name} on attempt {attempt + 1} at timestamp {timestamp}")
-                    break
-                else:
-                    logger.info(f"Keyword '{keyword}' not detected in {user_name} on attempt {attempt + 1}")
-                
-                attempt += 1
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout processing stream {user_name} on attempt {attempt + 1}")
-            attempt += 1
-            continue
+            result = await detect_keyword(wav, keyword)
         except Exception as e:
-            logger.error(f"Error processing stream {user_name} on attempt {attempt + 1}: {str(e)}")
-            attempt += 1
+            last_error = str(e)
             continue
-    if not keyword_detected:
-            reason = f"Keyword not detected after {max_attempts} attempts"
-            logger.warning(f"{reason} for {user_name}")
-            return {"user_name": user_name, "keyword_detected": False, "reason": reason}
-        
-    return {"user_name": user_name, "keyword_detected": True, "timestamp": timestamp}
+        checked += 1
+        offset = parse_timestamp(result)
+        if offset is None:  # "NO", or anything that isn't a timestamp
+            continue
+        seconds_ago = max(0, back - offset)
+        spoken_at = captured_at - datetime.timedelta(seconds=seconds_ago)
+        out = {
+            **base,
+            "keyword_detected": True,
+            "timestamp": result,
+            "seconds_ago": round(seconds_ago),
+            "spoken_at": spoken_at.isoformat(),
+            "link": stream_url,
+            "link_type": "live",
+        }
+        vod = await vod_lookup(stream["user_id"])
+        if vod:
+            vod_seconds = (spoken_at - vod["created_at"]).total_seconds() - 5  # 5s lead-in
+            out["link"] = f"{vod['url']}?t={fmt_hms(vod_seconds)}"
+            out["link_type"] = "vod"
+        return out
+
+    reason = f"Keyword not detected in {checked} window(s) of {WINDOW_SECONDS}s"
+    if last_error:
+        reason += f" (last error: {last_error[:200]})"
+    return {**base, "keyword_detected": False, "reason": reason}
+
 
 @app.post("/search_streams")
 async def search_streams(query: SearchQuery):
     """API endpoint to search Twitch streams and detect keyword."""
     try:
 
-        cached_results = await check_cached_results(query.query, query.keyword,str(query.max_results))
+        query.max_results = min(max(query.max_results, 1), MAX_STREAMS)
+        query.max_attempts = min(max(query.max_attempts, 1), MAX_WINDOWS)
+        cached_results = await check_cached_results(query.query, query.keyword,f"{query.max_results}_{query.max_attempts}")
         if cached_results:
             logger.info(f"Returning cached results for query: {query.query}, keyword: {query.keyword}")
             return cached_results
 
 
         # Get access token
-        access_token = await get_access_token(CLIENT_ID, CLIENT_SECRET)
+        access_token = await with_retries(get_access_token, CLIENT_ID, CLIENT_SECRET)
 
         # Fetch streams
-        streams = await get_live_streams(
-            query.query, CLIENT_ID, access_token, query.max_results
+        streams = await with_retries(
+            get_live_streams, query.query, CLIENT_ID, access_token, query.max_results
         )
 
         if not streams:
@@ -263,7 +430,21 @@ async def search_streams(query: SearchQuery):
             )
 
         # Process streams concurrently
-        tasks = [process_stream(stream, query.keyword) for stream in streams]
+        vod_cache = {}
+
+        async def vod_lookup(user_id):
+            if user_id not in vod_cache:
+                try:
+                    vod_cache[user_id] = await with_retries(
+                        get_current_vod, user_id, CLIENT_ID, access_token
+                    )
+                except Exception as e:
+                    logger.warning(f"VOD lookup failed for {user_id}: {e}")
+                    vod_cache[user_id] = None
+            return vod_cache[user_id]
+
+        max_attempts = query.max_attempts
+        tasks = [process_stream(stream, query.keyword, vod_lookup, max_attempts) for stream in streams]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Format response
@@ -278,18 +459,7 @@ async def search_streams(query: SearchQuery):
                     )
                 response.append(result)
 
-        await store_results(query.query, query.keyword, str(query.max_results), response)
-
-
-        # prompt = f"Find me 10 similar words to {query.keyword} and respond with them comma seperated. Only give me the comma seperated words. Do not duplicate any words"
-        # resp = client.models.generate_content(
-        # model='gemini-2.0-flash',
-        # contents=[prompt])
-        # keywordss = resp.text.strip().split(",")
-        # print(keywordss)
-        # for key in keywordss:
-        #     print(key)
-        #     await store_results(query.query, key, str(query.max_results), resp)
+        await store_results(query.query, query.keyword, f"{query.max_results}_{query.max_attempts}", response)
 
         return response
 

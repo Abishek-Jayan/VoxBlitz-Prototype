@@ -7,6 +7,10 @@ const SearchForm = ({
   isLoading,
   onQueryChange,
   onKeywordChange,
+  maxAttempts,
+  onMaxAttemptsChange,
+  maxResults,
+  onMaxResultsChange,
   onSubmit,
 }) => {
   return (
@@ -37,6 +41,36 @@ const SearchForm = ({
               disabled={isLoading}
             />
           </div>
+        </div>
+
+        <div className="flex flex-col sm:flex-row items-center justify-center gap-3 text-sm text-gray-500">
+          <label className="flex items-center space-x-2">
+            <span>Check</span>
+            <select
+              value={maxResults}
+              onChange={(e) => onMaxResultsChange(Number(e.target.value))}
+              disabled={isLoading}
+              className="rounded-lg border border-gray-200 bg-white px-2 py-1 text-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              {[5, 10, 20, 30].map((n) => (
+                <option key={n} value={n}>{n} streams</option>
+              ))}
+            </select>
+          </label>
+          <label className="flex items-center space-x-2">
+            <span>Look back</span>
+            <select
+              value={maxAttempts}
+              onChange={(e) => onMaxAttemptsChange(Number(e.target.value))}
+              disabled={isLoading}
+              title="Twitch only exposes ~30s of live history"
+              className="rounded-lg border border-gray-200 bg-white px-2 py-1 text-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              {[1, 2, 3].map((n) => (
+                <option key={n} value={n}>{n * 10}s ({n} {n === 1 ? 'window' : 'windows'})</option>
+              ))}
+            </select>
+          </label>
         </div>
         
         {/* <button

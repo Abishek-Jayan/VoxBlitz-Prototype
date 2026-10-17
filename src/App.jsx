@@ -8,9 +8,18 @@ import ErrorDisplay from './components/ErrorDisplay';
 function App() {
   const [query, setQuery] = useState('');
   const [keyword, setKeyword] = useState('');
+  const [maxAttempts, setMaxAttempts] = useState(3);
+  const [maxResults, setMaxResults] = useState(10);
   const [results, setResults] = useState([]);
+  const [searchedKeyword, setSearchedKeyword] = useState('');
+  const [hasSearched, setHasSearched] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
+
+  const hits = results.filter((r) => r.keyword_detected === true);
+  const failures = results.filter(
+    (r) => r.keyword_detected !== true && /error|failed/i.test(r.reason || '')
+  ).length;
 
   const handleSearch = async (e) => {
     e.preventDefault();
@@ -29,7 +38,7 @@ function App() {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ query, keyword }),
+        body: JSON.stringify({ query, keyword, max_attempts: maxAttempts, max_results: maxResults }),
       });
 
       if (!response.ok) {
@@ -37,6 +46,8 @@ function App() {
       }
 
       const data = await response.json();
+      setSearchedKeyword(keyword);
+      setHasSearched(true);
       setResults(data);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An unknown error occurred');
@@ -68,6 +79,10 @@ function App() {
                 isLoading={isLoading}
                 onQueryChange={setQuery}
                 onKeywordChange={setKeyword}
+                maxAttempts={maxAttempts}
+                onMaxAttemptsChange={setMaxAttempts}
+                maxResults={maxResults}
+                onMaxResultsChange={setMaxResults}
                 onSubmit={handleSearch}
               />
               
@@ -77,15 +92,15 @@ function App() {
               <div className="space-y-4">
                 {isLoading ? (
                   <LoadingSpinner />
-                ) : results.length > 0 ? (
+                ) : hasSearched ? (
                   <div className="grid gap-4 animate-fadeIn">
-                    {results.map((result, index) => (
-                      <div 
-                        key={index} 
-                        className="animate-fadeIn" 
-                        style={{ animationDelay: `${index * 100}ms` }}
-                      >
-                        <ResultCard result={result} />
+                    <p className="text-sm text-gray-500">
+                      {hits.length} match{hits.length === 1 ? '' : 'es'} from {results.length} live streams
+                      {failures > 0 && ` (${failures} could not be fully checked, e.g. API rate limit)`}
+                    </p>
+                    {hits.map((result, index) => (
+                      <div key={index} className="animate-fadeIn" style={{ animationDelay: `${index * 100}ms` }}>
+                        <ResultCard result={result} keyword={searchedKeyword} />
                       </div>
                     ))}
                   </div>
